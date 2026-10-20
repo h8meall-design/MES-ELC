@@ -1,6 +1,14 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { createClient } from '@supabase/supabase-js';
+
+// Инициализируем Supabase прямо здесь
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: { persistSession: false },
+});
 
 // ============================================================
 // ТИПЫ
@@ -111,6 +119,111 @@ interface Motor {
   extraSteps?: MotorStep[];
   selectedTemplateId?: string;
   checkedDefectIds?: string[];
+}
+
+// ============================================================
+// КОНВЕРТАЦИЯ Supabase <-> клиент (camelCase ↔ snake_case)
+// ============================================================
+function toDbMotor(m: Motor) {
+  return {
+    id: m.id,
+    batch_id: m.batchId,
+    customer_shop: m.customerShop,
+    customer_name: m.customerName,
+    customer_phone: m.customerPhone,
+    repair_type: m.repairType ?? null,
+    model: m.model,
+    serial_number: m.serialNumber,
+    power: m.power,
+    rpm: m.rpm,
+    complaint: m.complaint,
+    scheduled_date: m.scheduledDate,
+    status: m.status,
+    created_at: m.createdAt,
+    schedule_started_at: m.scheduleStartedAt ?? null,
+    accepted_at: m.acceptedAt ?? null,
+    ready_at: m.readyAt ?? null,
+    shipped_at: m.shippedAt ?? null,
+    cell_number: m.cellNumber ?? null,
+    inspector_name: m.inspectorName ?? null,
+    found_defects: m.foundDefects ?? null,
+    defect_note: m.defectNote ?? null,
+    last_template_id: m.lastTemplateId ?? null,
+    last_checked_defect_ids: m.lastCheckedDefectIds ?? null,
+    last_defect_date: m.lastDefectDate ?? null,
+    last_cell_number: m.lastCellNumber ?? null,
+    defect_selections: m.defectSelections ?? null,
+    notes: m.notes ?? null,
+    notes_logs: m.notesLogs ?? null,
+    worker_note: m.workerNote ?? null,
+    attachments: m.attachments ?? [],
+    logs: m.logs ?? [],
+    nodes: m.nodes ?? [],
+    extra_steps: m.extraSteps ?? null,
+    selected_template_id: m.selectedTemplateId ?? null,
+    checked_defect_ids: m.checkedDefectIds ?? null,
+  };
+}
+
+function fromDbMotor(row: any): Motor {
+  return {
+    id: row.id,
+    batchId: row.batch_id ?? '',
+    customerShop: row.customer_shop ?? '',
+    customerName: row.customer_name ?? '',
+    customerPhone: row.customer_phone ?? '',
+    repairType: row.repair_type ?? undefined,
+    model: row.model ?? '',
+    serialNumber: row.serial_number ?? '',
+    power: row.power ?? '',
+    rpm: row.rpm ?? '',
+    complaint: row.complaint ?? '',
+    scheduledDate: row.scheduled_date ?? '',
+    status: row.status,
+    createdAt: row.created_at ?? new Date().toISOString(),
+    scheduleStartedAt: row.schedule_started_at ?? undefined,
+    acceptedAt: row.accepted_at ?? undefined,
+    readyAt: row.ready_at ?? undefined,
+    shippedAt: row.shipped_at ?? undefined,
+    cellNumber: row.cell_number ?? undefined,
+    inspectorName: row.inspector_name ?? undefined,
+    foundDefects: row.found_defects ?? undefined,
+    defectNote: row.defect_note ?? undefined,
+    lastTemplateId: row.last_template_id ?? undefined,
+    lastCheckedDefectIds: row.last_checked_defect_ids ?? undefined,
+    lastDefectDate: row.last_defect_date ?? undefined,
+    lastCellNumber: row.last_cell_number ?? undefined,
+    defectSelections: row.defect_selections ?? undefined,
+    notes: row.notes ?? undefined,
+    notesLogs: row.notes_logs ?? undefined,
+    workerNote: row.worker_note ?? undefined,
+    attachments: row.attachments ?? [],
+    logs: row.logs ?? [],
+    nodes: row.nodes ?? [],
+    extraSteps: row.extra_steps ?? undefined,
+    selectedTemplateId: row.selected_template_id ?? undefined,
+    checkedDefectIds: row.checked_defect_ids ?? undefined,
+  };
+}
+
+function toDbTemplate(t: DefectTemplate) {
+  return {
+    id: t.id,
+    name: t.name,
+    nodes: t.nodes ?? [],
+    flow_blocks: t.flowBlocks ?? null,
+    flow_connections: t.flowConnections ?? null,
+  };
+}
+
+function fromDbTemplate(row: any): DefectTemplate {
+  return {
+    id: row.id,
+    name: row.name,
+    nodes: row.nodes ?? [],
+    flowBlocks: row.flow_blocks ?? undefined,
+    flowConnections: row.flow_connections ?? undefined,
+  };
 }
 
 // ============================================================
@@ -603,37 +716,214 @@ export default function HomePage() {
   const [loaded, setLoaded] = useState(false);
   const [readLogs, setReadLogs] = useState<Record<string, number>>({});
 
+  // Защита от эхо-петель и устаревших замыканий
+  const motorsJsonRef = useRef('');
+  const templatesJsonRef = useRef('');
+  const readLogsJsonRef = useRef('');
+  const motorsRef = useRef<Motor[]>([]);
+  const lastUserChangeRef = useRef<number>(0);
+
+  useEffect(() => { motorsRef.current = motors; }, [motors]);
+
+  // ---------- Загрузка из Supabase (один раз при монтировании) ----------
   useEffect(() => {
-    try {
-      const savedMotors = localStorage.getItem('mes_motors_v29');
-      if (savedMotors) setMotors(JSON.parse(savedMotors));
-      const savedTemplates = localStorage.getItem('mes_templates_v29');
-      if (savedTemplates) setTemplates(JSON.parse(savedTemplates));
-      else {
-        const { blocks, connections } = createDefaultFlow();
-        setTemplates([{ id: 'default-1', name: 'Стандартная ведомость АИР', nodes: [], flowBlocks: blocks, flowConnections: connections }]);
+    const load = async () => {
+      try {
+        const [mRes, tRes] = await Promise.all([
+          supabase.from('motors').select('*'),
+          supabase.from('templates').select('*'),
+        ]);
+
+        const loadedMotors: Motor[] = (mRes.data || []).map(fromDbMotor);
+
+        // Авто-миграция из старого localStorage (если в БД пусто, а в LS данные есть)
+        let finalMotors = loadedMotors;
+        try {
+          const legacy = typeof window !== 'undefined' ? localStorage.getItem('mes_motors_v29') : null;
+          if (legacy && loadedMotors.length === 0) {
+            const parsed = JSON.parse(legacy) as Motor[];
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              await supabase.from('motors').upsert(parsed.map(toDbMotor));
+              finalMotors = parsed;
+              localStorage.removeItem('mes_motors_v29');
+            }
+          }
+        } catch (e) { /* ignore */ }
+
+        setMotors(finalMotors);
+        motorsRef.current = finalMotors;
+        motorsJsonRef.current = JSON.stringify(finalMotors);
+
+        let loadedTemplates: DefectTemplate[] = (tRes.data || []).map(fromDbTemplate);
+        if (loadedTemplates.length === 0) {
+          const { blocks, connections } = createDefaultFlow();
+          const defaultTpl: DefectTemplate = {
+            id: 'default-1',
+            name: 'Стандартная ведомость АИР',
+            nodes: [],
+            flowBlocks: blocks,
+            flowConnections: connections,
+          };
+          await supabase.from('templates').upsert(toDbTemplate(defaultTpl), { onConflict: 'id' });
+          loadedTemplates = [defaultTpl];
+        }
+        setTemplates(loadedTemplates);
+        templatesJsonRef.current = JSON.stringify(loadedTemplates);
+      } catch (e) {
+        console.error('Ошибка загрузки из Supabase:', e);
+      } finally {
+        setLoaded(true);
       }
-      const savedReadLogs = localStorage.getItem('mes_read_logs');
-      if (savedReadLogs) setReadLogs(JSON.parse(savedReadLogs));
-    } catch (e) {}
-    setLoaded(true);
+    };
+    load();
   }, []);
 
+  // ---------- Загрузка read-логов при смене роли ----------
+  useEffect(() => {
+    if (!role) return;
+    const loadRead = async () => {
+      try {
+        const { data } = await supabase
+          .from('read_state')
+          .select('*')
+          .eq('role', role)
+          .maybeSingle();
+        const logs = (data?.data as Record<string, number>) || {};
+        setReadLogs(logs);
+        readLogsJsonRef.current = JSON.stringify(logs);
+      } catch (e) {
+        console.error('Ошибка загрузки read_state:', e);
+      }
+    };
+    loadRead();
+  }, [role]);
+
+  // ---------- Сохранение моторов (debounce 400мс) ----------
   useEffect(() => {
     if (!loaded) return;
-    try {
-      localStorage.setItem('mes_motors_v29', JSON.stringify(motors));
-      localStorage.setItem('mes_templates_v29', JSON.stringify(templates));
-      localStorage.setItem('mes_read_logs', JSON.stringify(readLogs));
-    } catch (e) { console.error('Ошибка сохранения', e); }
-  }, [motors, templates, loaded, readLogs]);
+    lastUserChangeRef.current = Date.now();
+    const json = JSON.stringify(motors);
+    if (json === motorsJsonRef.current) return;
 
-  const markLogsRead = (id: string, count: number) => setReadLogs(prev => ({ ...prev, [id]: count }));
+    const timer = setTimeout(async () => {
+      try {
+        const { data: existing } = await supabase.from('motors').select('id');
+        const existingIds = new Set((existing || []).map((r: any) => r.id));
+        const currentIds = new Set(motors.map(m => m.id));
+        const toDelete = [...existingIds].filter(id => !currentIds.has(id));
+
+        if (motors.length > 0) {
+          const { error } = await supabase.from('motors').upsert(motors.map(toDbMotor));
+          if (error) console.error('upsert motors:', error);
+        }
+        if (toDelete.length > 0) {
+          const { error } = await supabase.from('motors').delete().in('id', toDelete);
+          if (error) console.error('delete motors:', error);
+        }
+        motorsJsonRef.current = json;
+      } catch (e) {
+        console.error('Ошибка сохранения моторов:', e);
+      }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [motors, loaded]);
+
+  // ---------- Сохранение шаблонов ----------
+  useEffect(() => {
+    if (!loaded) return;
+    const json = JSON.stringify(templates);
+    if (json === templatesJsonRef.current) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        const { data: existing } = await supabase.from('templates').select('id');
+        const existingIds = new Set((existing || []).map((r: any) => r.id));
+        const currentIds = new Set(templates.map(t => t.id));
+        const toDelete = [...existingIds].filter(id => !currentIds.has(id));
+
+        if (templates.length > 0) {
+          const { error } = await supabase.from('templates').upsert(templates.map(toDbTemplate));
+          if (error) console.error('upsert templates:', error);
+        }
+        if (toDelete.length > 0) {
+          const { error } = await supabase.from('templates').delete().in('id', toDelete);
+          if (error) console.error('delete templates:', error);
+        }
+        templatesJsonRef.current = json;
+      } catch (e) {
+        console.error('Ошибка сохранения шаблонов:', e);
+      }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [templates, loaded]);
+
+  // ---------- Сохранение read-логов ----------
+  useEffect(() => {
+    if (!loaded || !role) return;
+    const json = JSON.stringify(readLogs);
+    if (json === readLogsJsonRef.current) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        const { error } = await supabase
+          .from('read_state')
+          .upsert({ role, data: readLogs }, { onConflict: 'role' });
+        if (error) console.error('upsert read_state:', error);
+        readLogsJsonRef.current = json;
+      } catch (e) {
+        console.error('Ошибка сохранения read_state:', e);
+      }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [readLogs, role, loaded]);
+
+  // ---------- Polling: подтягиваем чужие изменения каждые 15 сек ----------
+  useEffect(() => {
+    if (!loaded) return;
+    const interval = setInterval(async () => {
+      if (Date.now() - lastUserChangeRef.current < 5000) return;
+      try {
+        const [mRes, tRes] = await Promise.all([
+          supabase.from('motors').select('*'),
+          supabase.from('templates').select('*'),
+        ]);
+        if (mRes.data) {
+          const fresh = mRes.data.map(fromDbMotor);
+          if (JSON.stringify(fresh) !== JSON.stringify(motorsRef.current)) {
+            setMotors(fresh);
+            motorsRef.current = fresh;
+            motorsJsonRef.current = JSON.stringify(fresh);
+          }
+        }
+        if (tRes.data) {
+          const freshT = tRes.data.map(fromDbTemplate);
+          if (JSON.stringify(freshT) !== templatesJsonRef.current) {
+            setTemplates(freshT);
+            templatesJsonRef.current = JSON.stringify(freshT);
+          }
+        }
+      } catch (e) {
+        console.error('Ошибка polling:', e);
+      }
+    }, 15000);
+    return () => clearInterval(interval);
+  }, [loaded]);
+
+  const markLogsRead = (id: string, count: number) =>
+    setReadLogs(prev => ({ ...prev, [id]: count }));
   const markAllLogsRead = () => {
     const newReadLogs = { ...readLogs };
     motors.forEach(m => { if (m.logs) newReadLogs[m.id] = m.logs.length; });
     setReadLogs(newReadLogs);
   };
+
+  if (!loaded) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-blue-900 via-slate-900 to-slate-800 flex items-center justify-center">
+        <div className="text-white text-lg font-medium animate-pulse">⚙️ Загрузка данных из Supabase…</div>
+      </div>
+    );
+  }
 
   if (!role) return <LoginScreen onLogin={setRole} />;
 
@@ -2756,7 +3046,6 @@ function PlannerView({ motors, setMotors, templates, readLogs, markLogsRead, mar
   const [infoMotor, setInfoMotor] = useState<Motor | null>(null);
   const [notesMotor, setNotesMotor] = useState<Motor | null>(null);
   const [kisDefectModal, setKisDefectModal] = useState<{ motorId: string; block: FlowBlock } | null>(null);
-  // ← ПРАВКА: добавлено serialNumber в фильтры
   const [filters, setFilters] = useState({ customerShop: '', repairType: '', serialNumber: '', model: '', power: '', rpm: '', scheduledDate: '', cellNumber: '', currentArea: '', action: '', logs: '', notes: '' });
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
   const [isPendingApprovalsOpen, setIsPendingApprovalsOpen] = useState(true);
@@ -2963,7 +3252,20 @@ function PlannerView({ motors, setMotors, templates, readLogs, markLogsRead, mar
                     <div className="mb-2">
                       <h3 className="font-bold text-slate-800">{m.model} (Инв. {m.serialNumber})</h3>
                       <p className="text-sm text-slate-500">Цех: {m.customerShop} • {m.customerName} • {m.customerPhone}</p>
-                      <p className="text-sm text-slate-600 mt-1">📅 Завоз: <strong>{m.scheduledDate}</strong></p>
+                      <div className="flex flex-wrap items-center gap-2 mt-2">
+                        <span className="text-xs font-bold text-slate-800 bg-slate-100 border border-slate-300 rounded px-2 py-0.5">
+                          🔧 Вид ремонта: {m.repairType || '-'}
+                        </span>
+                        <span className="text-xs text-slate-600">
+                          {m.power ? `${m.power} кВт` : ''}{m.rpm ? ` • ${m.rpm} об/мин` : ''}
+                        </span>
+                      </div>
+                      <p className="text-sm text-slate-600 mt-2">📅 Завоз: <strong>{m.scheduledDate}</strong></p>
+                      {m.complaint && (
+                        <div className="mt-2 text-xs text-yellow-900 bg-yellow-50 border border-yellow-200 rounded p-2 whitespace-pre-wrap">
+                          <strong>💬 Пожелания:</strong> {m.complaint}
+                        </div>
+                      )}
                     </div>
                     <div className="mt-auto pt-3 flex gap-2">
                       <button onClick={() => approveRequest(m.id)} className="flex-1 bg-green-600 hover:bg-green-700 text-white text-xs font-medium py-2 rounded-lg">Согласовать</button>
@@ -3016,13 +3318,11 @@ function PlannerView({ motors, setMotors, templates, readLogs, markLogsRead, mar
           </div>
           
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto w-full">
-            {/* ← ПРАВКА: min-w увеличен для новой колонки */}
             <table className="w-full text-left text-xs whitespace-nowrap min-w-[1400px]">
               <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 align-top">
                 <tr>
                   <th className="px-2 py-2 font-medium"><div className="flex flex-col gap-1"><span onClick={() => requestSort('customerShop')} className="cursor-pointer select-none flex items-center gap-1">Цех {getSortIcon('customerShop')}</span><input value={filters.customerShop} onChange={e => setFilters({...filters, customerShop: e.target.value})} placeholder="Поиск..." className="border border-slate-300 px-1 py-1 text-[10px] rounded w-full font-normal outline-none focus:border-blue-500" /></div></th>
                   <th className="px-2 py-2 font-medium"><div className="flex flex-col gap-1"><span onClick={() => requestSort('repairType')} className="cursor-pointer select-none flex items-center gap-1">Вид {getSortIcon('repairType')}</span><input value={filters.repairType} onChange={e => setFilters({...filters, repairType: e.target.value})} placeholder="СР/КР" className="border border-slate-300 px-1 py-1 text-[10px] rounded w-full font-normal outline-none focus:border-blue-500" /></div></th>
-                  {/* ← НОВАЯ КОЛОНКА: Инв. № */}
                   <th className="px-2 py-2 font-medium"><div className="flex flex-col gap-1"><span onClick={() => requestSort('serialNumber')} className="cursor-pointer select-none flex items-center gap-1">Инв. № {getSortIcon('serialNumber')}</span><input value={filters.serialNumber} onChange={e => setFilters({...filters, serialNumber: e.target.value})} placeholder="Поиск..." className="border border-slate-300 px-1 py-1 text-[10px] rounded w-full font-normal outline-none focus:border-blue-500" /></div></th>
                   <th className="px-2 py-2 font-medium"><div className="flex flex-col gap-1"><span onClick={() => requestSort('model')} className="cursor-pointer select-none flex items-center gap-1">Тип {getSortIcon('model')}</span><input value={filters.model} onChange={e => setFilters({...filters, model: e.target.value})} placeholder="Поиск..." className="border border-slate-300 px-1 py-1 text-[10px] rounded w-full font-normal outline-none focus:border-blue-500" /></div></th>
                   <th className="px-2 py-2 font-medium"><div className="flex flex-col gap-1"><span onClick={() => requestSort('power')} className="cursor-pointer select-none flex items-center gap-1">Мощн {getSortIcon('power')}</span><input value={filters.power} onChange={e => setFilters({...filters, power: e.target.value})} placeholder="кВт" className="border border-slate-300 px-1 py-1 text-[10px] rounded w-full font-normal outline-none focus:border-blue-500" /></div></th>
@@ -3050,7 +3350,6 @@ function PlannerView({ motors, setMotors, templates, readLogs, markLogsRead, mar
                         </div>
                       </td>
                       <td className="px-2 py-2 text-slate-600 font-bold">{m.repairType}</td>
-                      {/* ← НОВАЯ ЯЧЕЙКА: Инв. № */}
                       <td className="px-2 py-2 text-slate-700 font-mono text-[11px]">{m.serialNumber || '-'}</td>
                       <td className="px-2 py-2 text-slate-800 font-medium">{m.model}</td>
                       <td className="px-2 py-2 text-slate-600">{m.power} кВт</td>
@@ -3080,7 +3379,6 @@ function PlannerView({ motors, setMotors, templates, readLogs, markLogsRead, mar
                     </tr>
                   );
                 })}
-                {/* ← ПРАВКА: colSpan 12 → 13 */}
                 {filteredAndSorted.length === 0 && <tr><td colSpan={13} className="px-2 py-8 text-center text-slate-400">Нет активных ремонтов</td></tr>}
               </tbody>
             </table>
@@ -3492,7 +3790,6 @@ function WorkerView({ motors, setMotors, templates, readLogs, markLogsRead }: {
   const renderMotorCard = (motor: Motor) => {
     const isNew = !seenNodes.includes(motor.id);
     const step = getExtraStep(motor, selectedArea);
-    // ← ПРАВКА: для разборки показываем вид ремонта + задание
     const isDisassembly = selectedArea === 'disassembly';
     return (
       <div key={motor.id} className={`bg-white rounded-xl shadow-sm border-2 p-4 relative ${isNew ? 'border-blue-400' : 'border-slate-200'}`}>
@@ -3512,7 +3809,6 @@ function WorkerView({ motors, setMotors, templates, readLogs, markLogsRead }: {
           <div className="text-xs text-slate-600 mb-2">📍 Ячейка: <strong>{motor.cellNumber}</strong></div>
         )}
 
-        {/* ← ПРАВКА: блок задачи у разборщика с видом ремонта */}
         {isDisassembly ? (
           <div className="mb-2 text-xs bg-amber-50 border border-amber-200 p-2 rounded space-y-1">
             <div className="flex items-center gap-2 flex-wrap">
